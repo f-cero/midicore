@@ -1,0 +1,9 @@
+build/
+*.o
+*.a
+*.wav
+*.mp3
+*.syn
+!examples/*.syn
+__pycache__/
+.pio/

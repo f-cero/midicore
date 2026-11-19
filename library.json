@@ -1,0 +1,16 @@
+{
+  "name": "midicore",
+  "version": "1.0.0",
+  "description": "Pure-synthesis MIDI engine for embedded game consoles: 4-op wavetable+FM voices, 66 KB GM bank, no floating point in the audio path.",
+  "keywords": ["midi", "synth", "audio", "esp32", "game", "wavetable", "fm", "chiptune"],
+  "license": "Apache-2.0",
+  "frameworks": "*",
+  "platforms": "*",
+  "headers": "midicore.h",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include",
+    "flags": ["-std=c99"]
+  },
+  "examples": ["examples/host_render.c"]
+}
