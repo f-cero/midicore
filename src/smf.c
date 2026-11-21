@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
+/*
  * smf.c -- Standard MIDI File parser.
  *
  * Events are converted to absolute sample frames at parse time, so the
@@ -55,6 +59,51 @@ void mc_song_free(mc_song* g) {
   free(g);
 }
 
+
+/* Pre-pass: walk every track and count real channel events so the event table
+ * can be sized exactly. Allocation becomes O(events in the song) instead of a
+ * fixed 300k-entry (~2.4 MB) table that no console could ever afford. */
+static uint32_t count_events(const uint8_t* p, const uint8_t* end, uint32_t limit)
+{
+  uint32_t count = 0;
+  while (p + 8 <= end && count < limit) {
+    if (memcmp(p, "MTrk", 4) != 0) break;
+    const uint32_t tlen = rd32(p + 4);
+    const uint8_t* q = p + 8;
+    const uint8_t* qend = q + tlen;
+    if (qend > end) qend = end;
+    p = qend;
+    uint8_t status = 0;
+    while (q < qend && count < limit) {
+      rdv(&q, qend);
+      if (q >= qend) break;
+      uint8_t c = *q;
+      if (c & 0x80) { status = c; q++; }
+      else if (!status) { q++; continue; }
+      if (status == 0xFF) {
+        q++;
+        if (q >= qend) break;
+        const uint32_t ml = rdv(&q, qend);
+        if (q + ml > qend) break;
+        q += ml;
+        continue;
+      }
+      if (status == 0xF0 || status == 0xF7) {
+        const uint32_t ml = rdv(&q, qend);
+        if (q + ml > qend) break;
+        q += ml;
+        continue;
+      }
+      const uint8_t hi = status & 0xF0;
+      const int na = (hi == 0xC0 || hi == 0xD0) ? 1 : 2;
+      if (q + na > qend) break;
+      q += na;
+      count++;
+    }
+  }
+  return count;
+}
+
 mc_song* mc_song_load(const void* data, size_t bytes, int sampleRate) {
   if (!data || bytes < 14 || sampleRate <= 0) return NULL;
   const uint8_t* b = (const uint8_t*)data;
@@ -80,7 +129,9 @@ mc_song* mc_song_load(const void* data, size_t bytes, int sampleRate) {
   mc_song* g = (mc_song*)calloc(1, sizeof(mc_song));
   Tempo* tp = (Tempo*)calloc(SMF_MAX_TEMPOS, sizeof(Tempo));
   if (!g || !tp) { free(g); free(tp); return NULL; }
-  g->ev = (struct mc_song_event*)calloc(SMF_MAX_EVENTS, sizeof(struct mc_song_event));
+  const uint32_t expected = count_events(b + 8 + hlen, end, SMF_MAX_EVENTS);
+  const uint32_t evCap = expected + 64;   /* guard: never trust the pre-pass blindly */
+  g->ev = (struct mc_song_event*)calloc(evCap, sizeof(struct mc_song_event));
   if (!g->ev) { free(g->ev); free(g); free(tp); return NULL; }
 
   uint32_t ntempo = 0;
@@ -98,7 +149,7 @@ mc_song* mc_song_load(const void* data, size_t bytes, int sampleRate) {
     uint32_t tick = 0;
     uint8_t status = 0;
 
-    while (q < qend && count < SMF_MAX_EVENTS) {
+    while (q < qend && count < evCap) {
       tick += rdv(&q, qend);
       if (q >= qend) break;
       uint8_t c = *q;

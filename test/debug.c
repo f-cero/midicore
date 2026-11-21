@@ -1,3 +1,7 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include "mc_internal.h"

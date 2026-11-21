@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
+/*
  * esp32_sd_player -- MIDI jukebox on an ESP32-S3 with an SD card.
  *
  *   /bank.syn      instrument bank (66 KB, from tools/sf2_to_bank.py)

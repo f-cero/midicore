@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
+/*
  * mc_tables.c -- rate and waveform tables, built once per sample rate.
  *
  * Floating point appears here and nowhere else: powf/expf run a handful of

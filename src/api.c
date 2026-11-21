@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
+/*
  * api.c -- lifecycle, MIDI channel state, and the sequencer.
  */
 #include "mc_internal.h"
@@ -14,8 +18,13 @@ mc_synth* mc_create(int sampleRate, int maxVoices) {
   if (!s) return NULL;
   s->sampleRate = sampleRate;
   s->maxVoices  = maxVoices;
-  s->masterGain = 2867;                 /* Q12, 0.70: headroom for 16 voices */
+  s->masterGain  = 2867;
+  s->musicVoices = maxVoices;
+  s->sfxStart    = 0;
+  s->sfxCount    = 0;
+  s->stealPolicy = MC_STEAL_OLDEST;                 /* Q12, 0.70: headroom for 16 voices */
   for (int c = 0; c < MC_MAX_CHANNELS; c++) {
+    s->drumCh[c] = (c == 9) ? 1 : 0;    /* GM default: channel 10 is drums */
     s->bend[c] = 65536;                 /* Q16, no bend */
     s->vol[c]  = 100;
     s->expr[c] = 127;
@@ -58,6 +67,16 @@ int mc_load_bank(mc_synth* s, const void* bank, size_t bytes) {
 void mc_program_change(mc_synth* s, int ch, int program) {
   if (!s || ch < 0 || ch > 15) return;
   s->prog[ch] = (uint8_t)(program & 127);
+  /* A program change on the drum channel means the file is using channel 10
+   * melodically. Game rips do this constantly; a General MIDI file never sends
+   * one to channel 10. mc_set_drum_channel() overrides this either way. */
+  if (s->drumCh[ch]) s->drumCh[ch] = 0;
+}
+
+void mc_set_drum_channel(mc_synth* s, int ch) {
+  if (!s) return;
+  for (int c = 0; c < MC_MAX_CHANNELS; c++) s->drumCh[c] = 0;
+  if (ch >= 0 && ch < MC_MAX_CHANNELS) s->drumCh[ch] = 1;
 }
 
 void mc_pitch_bend(mc_synth* s, int ch, int value) {
@@ -80,7 +99,8 @@ void mc_pitch_bend(mc_synth* s, int ch, int value) {
 
 void mc_control_change(mc_synth* s, int ch, int cc, int value) {
   if (!s || ch < 0 || ch > 15) return;
-  if (value < 0) value = 0; if (value > 127) value = 127;
+  if (value < 0) value = 0;
+  if (value > 127) value = 127;
   switch (cc) {
     case 7:  s->vol[ch] = (uint8_t)value; break;
     case 11: s->expr[ch] = (uint8_t)value; break;
@@ -143,8 +163,10 @@ static void dispatch(mc_synth* s, const struct mc_song_event* e) {
   const int ch = e->type & 0x0F;
   switch (e->type & 0xF0) {
     case 0x80: mc_note_off(s, ch, e->a); break;
-    case 0x90: if (e->b) mc_note_on(s, ch, e->a, e->b);
-               else mc_note_off(s, ch, e->a); break;
+    case 0x90:
+      if (e->b) mc_note_on(s, ch, e->a, e->b);
+      else      mc_note_off(s, ch, e->a);
+      break;
     case 0xB0: mc_control_change(s, ch, e->a, e->b); break;
     case 0xC0: mc_program_change(s, ch, e->a); break;
     case 0xE0: mc_pitch_bend(s, ch, ((int)e->b << 7 | e->a) - 8192); break;

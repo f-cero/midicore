@@ -101,6 +101,34 @@ port/esp32/ I2S output glue
 docs/       FORMAT.md ARCHITECTURE.md PORTING.md PERFORMANCE.md
 ```
 
+## Validation
+
+The engine ships with its own regression suite: eight generated test MIDIs and a
+validator that asserts properties on the rendered audio.
+
+```bash
+python3 tools/mk_tests.py build/tests && python3 tools/validate.py
+```
+
+Current: **24 of 24 checks pass**, pitch accurate to **0.95 cents mean / 2.7
+cents worst**. The suite found six real bugs in 1.0.0 — see
+[docs/VALIDATION.md](docs/VALIDATION.md).
+
+## Anti-aliasing
+
+A stored cycle holds 96 harmonics; played high, the excess folds back. Measured
+on isolated notes: **16.3 % mean aliased energy, 85 % on a bright instrument at
+MIDI 96**. `mc_build_mips()` derives band-limited levels at init from the single
+stored cycle — **0.0 % aliasing, zero flash cost**, ~150 KB RAM and ~40 % CPU.
+Options and trade-offs in [docs/ANTIALIASING.md](docs/ANTIALIASING.md).
+
+## Waveform fidelity
+
+`tools/compare_bank.py` measures every synthesised program against the sample it
+came from: **62 of 128** match the source spectrum closely (cosine >= 0.95), 50
+are partial, 16 are poor, and **26 do not resolve to a preset at all**. Details
+and causes in [docs/SAMPLE-COMPARISON.md](docs/SAMPLE-COMPARISON.md).
+
 ## Status, honestly
 
 Verified on host: builds warning-free, renders 58 s of MIDI in 227 ms

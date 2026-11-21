@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
+/*
  * host_render.c -- render a MIDI file to a WAV on the PC, using the exact
  * engine that runs on the target. Same call sequence a firmware would use.
  *
@@ -55,6 +59,12 @@ int main(int argc, char** argv) {
     fprintf(stderr, "bank rejected: %s\n", mc_last_error(s));
     return 1;
   }
+  /* band-limited mip levels: ~150 KB, allocated once, outside the audio path */
+  const size_t mipBytes = 160u * 1024u;
+  void* mipBuf = malloc(mipBytes);
+  const int nlevels = mipBuf ? mc_build_mips(s, mipBuf, mipBytes) : 0;
+  if (getenv("MC_MIPS")) fprintf(stderr, "mips: %d levels derived\n", nlevels);
+
   mc_song* g = mc_song_load(midi, mn, rate);
   if (!g) { fprintf(stderr, "midi parse failed\n"); return 1; }
 

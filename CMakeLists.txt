@@ -7,6 +7,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 add_library(midicore STATIC
     src/synth.c
     src/smf.c
+    src/seq.c
     src/api.c
     src/mc_tables.c
 )

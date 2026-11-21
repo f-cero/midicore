@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
+/*
  * synth.c -- the midicore voice engine.
  *
  * One voice = up to four operators. Each operator is a 256-point single-cycle
@@ -19,6 +23,17 @@ static inline int32_t clamp16(int32_t v) {
   if (v > 32767) return 32767;
   if (v < -32768) return -32768;
   return v;
+}
+
+/* FM phase offset in Q32. (m*level)>>5 can reach ~130k, and shifting that by
+ * 16 exceeds int32, so the clamp happens before the cast: level 127 is capped
+ * at ~2 cycles of modulation depth instead of wrapping to an arbitrary value. */
+static inline uint32_t fm_off(int32_t m, int level) {
+  int64_t v = ((int64_t)m * (int64_t)level) >> 5;
+  v <<= 16;
+  if (v >  0x7FFFFFFFLL) v =  0x7FFFFFFFLL;
+  if (v < -0x7FFFFFFFLL) v = -0x7FFFFFFFLL;
+  return (uint32_t)(int32_t)v;
 }
 
 static inline int32_t tab_read(const int16_t* t, uint32_t phase) {
@@ -43,31 +58,54 @@ static inline uint32_t note_inc(int note, int sampleRate) {
   int rem = semis % 12;
   if (rem < 0) { rem += 12; oct -= 1; }
 
-  int64_t hz = ((int64_t)440 * (int64_t)kSemis[rem]) >> 30;   /* whole Hz */
-  if (oct > 0) hz <<= oct; else hz >>= -oct;
-  if (hz <= 0) return 1;
-  return (uint32_t)((hz << 32) / (int64_t)sampleRate);
+  /* Q10 Hz keeps 10 fractional bits. Truncating to whole Hz puts a 30.9 Hz
+   * note at 30 Hz -- 49 cents flat, and audible on a bass line. */
+  int64_t v = ((int64_t)440 * (int64_t)kSemis[rem]) >> 20;   /* Q10 Hz */
+  if (oct > 0) v <<= oct; else v >>= -oct;
+  if (v <= 0) return 1;
+  /* Q10 Hz -> Q32 phase: v / 1024 * 2^32 / sampleRate */
+  return (uint32_t)((v << 22) / (int64_t)sampleRate);
 }
 
 /* ------------------------------------------------------------------ voice */
-static mc_voice* alloc_voice(mc_synth* s) {
-  mc_voice* oldestIdle = NULL;
-  mc_voice* oldestReleased = NULL;
-  for (int i = 0; i < s->maxVoices; i++) {
+static mc_voice* alloc_voice_pool(mc_synth* s, int pool, int prio) {
+  int lo = 0, hi = s->maxVoices;
+  if (s->sfxCount > 0) {
+    if (pool == 1) { lo = s->sfxStart; hi = s->sfxStart + s->sfxCount; }
+    else           { lo = 0;           hi = s->musicVoices; }
+  }
+  if (hi > s->maxVoices) hi = s->maxVoices;
+  if (lo >= hi) { lo = 0; hi = s->maxVoices; }
+
+  mc_voice* idle = NULL;
+  mc_voice* rel  = NULL;
+  for (int i = lo; i < hi; i++) {
     mc_voice* v = &s->voices[i];
-    if (!v->active) {
-      if (!oldestIdle || v->age < oldestIdle->age) oldestIdle = v;
-    } else if (v->released) {
-      if (!oldestReleased || v->age < oldestReleased->age) oldestReleased = v;
+    if (!v->active) { if (!idle || v->age < idle->age) idle = v; }
+    else if (v->released) { if (!rel || v->age < rel->age) rel = v; }
+  }
+  if (idle) return idle;
+  if (rel)  return rel;
+
+  mc_voice* o = NULL;
+  for (int i = lo; i < hi; i++) {
+    mc_voice* v = &s->voices[i];
+    if (!v->active) continue;
+    if (!o) { o = v; continue; }
+    switch (s->stealPolicy) {
+      case MC_STEAL_QUIETEST:
+        if (v->velGain < o->velGain) { o = v; }
+        break;
+      case MC_STEAL_LOWPRI:
+        if (v->prio < o->prio || (v->prio == o->prio && v->age < o->age)) { o = v; }
+        break;
+      default:
+        if (v->age < o->age) { o = v; }
+        break;
     }
   }
-  if (oldestIdle) return oldestIdle;
-  if (oldestReleased) return oldestReleased;
-  /* everything sounding: steal the oldest */
-  mc_voice* o = &s->voices[0];
-  for (int i = 1; i < s->maxVoices; i++)
-    if (s->voices[i].active && s->voices[i].age < o->age) o = &s->voices[i];
-  return o;
+  (void)prio;
+  return o ? o : &s->voices[lo];
 }
 
 /* Recompute the per-operator increments, e.g. after a pitch bend. */
@@ -82,6 +120,7 @@ static void recompute_incs(mc_synth* s, mc_voice* v) {
     inc = (inc * (int64_t)s->bend[v->ch]) >> 16;
     v->op[i].inc = (uint32_t)inc;
     v->op[i].vibScale = (uint32_t)(((int64_t)v->op[i].inc * p->lfoVib) >> 15);
+    v->op[i].tbl = mc_pick_table(s, o->table, (int64_t)v->op[i].inc);
   }
   if (p->pitchEnvAmt) {
     /* a short one-shot pitch sweep at note-on, depth in semitones */
@@ -96,20 +135,24 @@ static void recompute_incs(mc_synth* s, mc_voice* v) {
 }
 
 /* ---------------------------------------------------------------- note in */
-void mc_note_on(mc_synth* s, int ch, int note, int vel) {
+static void note_on_impl(mc_synth* s, int ch, int note, int vel, int pool, int prio) {
   if (!s || !s->hasBank) return;
   if (ch < 0 || ch > 15 || note < 0 || note > 127) return;
   if (vel <= 0) { mc_note_off(s, ch, note); return; }
   if (vel > 127) vel = 127;
 
   int program = s->prog[ch];
-  const mc_patch* p = (ch == 9) ? mc_bank_drum(&s->bank, note)
-                                : mc_bank_patch(&s->bank, program);
+  const mc_patch* p = s->drumCh[ch] ? mc_bank_drum(&s->bank, note)
+                                    : mc_bank_patch(&s->bank, program);
   if (!p) return;
 
-  mc_voice* v = alloc_voice(s);
+  mc_voice* v = alloc_voice_pool(s, pool, prio);
+  if (!v) return;
   memset(v, 0, sizeof(*v));
   v->active   = 1;
+  v->pool     = (uint8_t)pool;
+  v->prio     = (uint8_t)prio;
+  v->handle   = (int16_t)(++s->sfxNextHandle);
   v->ch       = (uint8_t)ch;
   v->note     = (uint8_t)note;
   v->vel      = (uint8_t)vel;
@@ -118,8 +161,15 @@ void mc_note_on(mc_synth* s, int ch, int note, int vel) {
   v->opCount  = p->opCount ? p->opCount : 1;
   if (v->opCount > MC_MAX_OPS) v->opCount = MC_MAX_OPS;
 
-  const int32_t velGain = 65536 - ((127 - vel) * p->velDepth * 258);  /* ~ Q16 */
-  const int32_t velQ = velGain < 0 ? 0 : velGain;
+  /* velocity curve: quadratic in velocity, scaled by the patch's depth.
+   * depth 0 means the patch ignores velocity entirely (organs, pads). */
+  const int32_t vcurve = (int32_t)(((int64_t)vel * vel * 65536) / (127 * 127));
+  const int32_t depth  = (int32_t)p->velDepth * 65536 / 127;
+  v->velGain = 65536 - (int32_t)(((int64_t)(65536 - vcurve) * depth) >> 16);
+  if (v->velGain < 0) v->velGain = 0;
+  v->panEff = (int8_t)(p->pan + s->pan[ch]);
+  if (v->panEff < -64) v->panEff = -64;
+  if (v->panEff >  63) v->panEff =  63;
 
   for (int i = 0; i < v->opCount; i++) {
     const mc_op* o = &p->op[i];
@@ -131,7 +181,6 @@ void mc_note_on(mc_synth* s, int ch, int note, int vel) {
     ov->relIdx = o->release;
     ov->inc = 0;
   }
-  (void)velQ;
   recompute_incs(s, v);
   v->lfoInc = (uint32_t)((int64_t)(1 << 28) * (int64_t)(2 + p->lfoRate) / (int64_t)s->sampleRate);
   v->lfoDelay = (uint16_t)((uint32_t)p->lfoDelay * 4u * (uint32_t)s->sampleRate / 1000u);
@@ -144,6 +193,7 @@ void mc_note_off(mc_synth* s, int ch, int note) {
   for (int i = 0; i < s->maxVoices; i++) {
     mc_voice* v = &s->voices[i];
     if (!v->active || v->released || v->note != note) continue;
+    if (v->pool == 1) continue;          /* one-shots die on their own */
     v->released = 1;
     for (int k = 0; k < v->opCount; k++) v->op[k].stage = 3;
   }
@@ -184,7 +234,7 @@ static inline int32_t op_step(mc_synth* s, int k, int32_t lfoS, uint32_t phaseOf
   if (lfoS && v->vibActive)
     inc += (uint32_t)(int32_t)(((int64_t)o->vibScale * lfoS) >> 15);
 
-  const int16_t* t = s->bank.tables + (size_t)po->table * MC_TABLE_LEN;
+  const int16_t* t = o->tbl ? o->tbl : (s->bank.tables + (size_t)po->table * MC_TABLE_LEN);
   int32_t smp = tab_read(t, o->phase + phaseOff);
   o->phase += inc;
 
@@ -217,8 +267,8 @@ static void render_voice(mc_synth* s, mc_voice* v, int frames) {
   int32_t* mixL = s->mixL;
   int32_t* mixR = s->mixR;
 
-  /* constant pan for the whole note */
-  const int32_t panPad = (int32_t)p->pan + 64;             /* 0..127 */
+  /* constant pan for the whole note: patch pan plus channel pan */
+  const int32_t panPad = (int32_t)v->panEff + 64;          /* 0..127 */
   const int32_t gainL  = ((128 - panPad) * p->gain) >> 7;  /* 0..127 */
   const int32_t gainR  = (panPad * p->gain) >> 7;
 
@@ -243,7 +293,7 @@ static void render_voice(mc_synth* s, mc_voice* v, int frames) {
         const int32_t m1 = op_step(s, 1, lfoS, 0, v, &dead);
         const int32_t md = ((m1 * p->op[1].level) >> 5);
         const int32_t o0 = op_step(s, 0, lfoS,
-                                   ((uint32_t)md << 16) + peOff, v, &dead);
+                                   fm_off(m1, p->op[1].level) + peOff, v, &dead);
         out = (o0 * p->op[0].out) >> 7;
         if (v->opCount > 2) {
           const int32_t o2 = op_step(s, 2, lfoS, peOff, v, &dead);
@@ -254,22 +304,22 @@ static void render_voice(mc_synth* s, mc_voice* v, int frames) {
       case MC_ALG_STACK: {
         const int32_t m3 = op_step(s, 3, lfoS, 0, v, &dead);
         const int32_t m2 = op_step(s, 2, lfoS,
-                                   ((uint32_t)((m3 * p->op[3].level) >> 5) << 16), v, &dead);
+                                   fm_off(m3, p->op[3].level), v, &dead);
         const int32_t m1 = op_step(s, 1, lfoS,
-                                   ((uint32_t)((m2 * p->op[2].level) >> 5) << 16), v, &dead);
+                                   fm_off(m2, p->op[2].level), v, &dead);
         const int32_t o0 = op_step(s, 0, lfoS,
-                                   ((uint32_t)((m1 * p->op[1].level) >> 5) << 16) + peOff, v, &dead);
+                                   fm_off(m1, p->op[1].level) + peOff, v, &dead);
         out = (o0 * p->op[0].out) >> 7;
         break;
       }
       case MC_ALG_PAIR: {
         const int32_t m1 = op_step(s, 1, lfoS, 0, v, &dead);
         const int32_t o0 = op_step(s, 0, lfoS,
-                                   ((uint32_t)((m1 * p->op[1].level) >> 5) << 16) + peOff, v, &dead);
+                                   fm_off(m1, p->op[1].level) + peOff, v, &dead);
         const int32_t m3 = (v->opCount > 3) ? op_step(s, 3, lfoS, 0, v, &dead) : 0;
         const int32_t o2 = (v->opCount > 2)
                              ? op_step(s, 2, lfoS,
-                                       ((uint32_t)((m3 * p->op[3].level) >> 5) << 16) + peOff, v, &dead)
+                                       fm_off(m3, p->op[3].level) + peOff, v, &dead)
                              : 0;
         out = ((o0 * p->op[0].out) >> 7) + ((o2 * p->op[2].out) >> 7);
         break;
@@ -290,6 +340,7 @@ static void render_voice(mc_synth* s, mc_voice* v, int frames) {
                         * depth) >> 30);
     }
 
+    out = (int32_t)(((int64_t)out * v->velGain) >> 16);
     const int32_t l = (out * gainL) >> 8;
     const int32_t r = (out * gainR) >> 8;
     mixL[i] += l;
@@ -394,4 +445,72 @@ const mc_patch* mc_bank_drum(const mc_bank* b, int note) {
   const int idx = MC_NUM_PROGRAMS + note;
   if (idx >= (int)b->numPatches) return NULL;
   return &b->patches[idx];
+}
+
+/* --------------------------------------------------------- voice pools */
+void mc_note_on(mc_synth* s, int ch, int note, int vel) {
+  note_on_impl(s, ch, note, vel, 0, 255);
+}
+
+int mc_set_voice_pools(mc_synth* s, int musicVoices, int sfxVoices) {
+  if (!s) return MC_ERR_ARG;
+  if (musicVoices < 0 || sfxVoices < 0) return MC_ERR_ARG;
+  if (musicVoices + sfxVoices > s->maxVoices) return MC_ERR_ARG;
+  if (musicVoices == 0 && sfxVoices == 0) {
+    s->musicVoices = s->maxVoices; s->sfxStart = 0; s->sfxCount = 0;
+    return MC_OK;
+  }
+  s->musicVoices = musicVoices;
+  s->sfxStart    = musicVoices;
+  s->sfxCount    = sfxVoices;
+  for (int i = 0; i < s->maxVoices; i++) {
+    const int inMusic = (i < musicVoices);
+    const int inSfx   = (i >= s->sfxStart && i < s->sfxStart + sfxVoices);
+    if (!inMusic && !inSfx) s->voices[i].active = 0;
+  }
+  return MC_OK;
+}
+
+void mc_set_steal_policy(mc_synth* s, mc_steal_t p) {
+  if (s) s->stealPolicy = (int)p;
+}
+
+int mc_sfx_play(mc_synth* s, int ch, int program, int note, int vel, int prio) {
+  if (!s || !s->hasBank || ch < 0 || ch > 15) return -1;
+  if (vel <= 0 || note < 0 || note > 127) return -1;
+  if (program < 0) program = 0;
+  const uint8_t oldProg = s->prog[ch];
+  const uint8_t oldDrum = s->drumCh[ch];
+  s->prog[ch]   = (uint8_t)(program & 127);
+  s->drumCh[ch] = 0;                    /* an effect names its own sound */
+  note_on_impl(s, ch, note, vel, 1, prio);
+  s->prog[ch]   = oldProg;
+  s->drumCh[ch] = oldDrum;
+
+  mc_voice* best = NULL;
+  for (int i = 0; i < s->maxVoices; i++) {
+    mc_voice* v = &s->voices[i];
+    if (!v->active || v->pool != 1 || v->note != note) continue;
+    if (!best || v->age > best->age) best = v;
+  }
+  return best ? (int)best->handle : -1;
+}
+
+void mc_sfx_stop(mc_synth* s, int handle) {
+  if (!s) return;
+  for (int i = 0; i < s->maxVoices; i++) {
+    mc_voice* v = &s->voices[i];
+    if (!v->active || v->released || v->handle != (int16_t)handle) continue;
+    if (v->pool != 1) continue;
+    v->released = 1;
+    for (int k = 0; k < v->opCount; k++) v->op[k].stage = 3;
+  }
+}
+
+int mc_sfx_active(const mc_synth* s) {
+  if (!s) return 0;
+  int n = 0;
+  for (int i = 0; i < s->maxVoices; i++)
+    if (s->voices[i].active && s->voices[i].pool == 1) n++;
+  return n;
 }

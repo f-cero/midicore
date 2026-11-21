@@ -1,3 +1,7 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
 /* esp32_midicore.cpp -- I2S output for midicore (ESP32-S3, IDF 5.x / Arduino 3.x). */
 #include "esp32_midicore.h"
 #include "driver/i2s_std.h"

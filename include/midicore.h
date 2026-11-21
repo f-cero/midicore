@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
+/*
  * midicore.h -- public API for the midicore synthesis engine and MIDI player.
  *
  * Design constraints, in priority order:
@@ -27,10 +31,53 @@
 
 #ifdef __cplusplus
 extern "C" {
+
+/* ------------------------------------------------- voice pools / one-shots
+ * Split the voice array so sound effects can never steal a music note and
+ * music can never steal an effect. Both pools are carved from maxVoices.
+ * Pools are optional: until mc_set_voice_pools() is called there is one pool.
+ */
+typedef enum {
+  MC_STEAL_OLDEST = 0,   /* default: first-in wins the axe   */
+  MC_STEAL_QUIETEST,     /* quietest voice is reused         */
+  MC_STEAL_LOWPRI        /* lowest prio, then oldest         */
+} mc_steal_t;
+
+int  mc_set_voice_pools(mc_synth* s, int musicVoices, int sfxVoices);
+void mc_set_steal_policy(mc_synth* s, mc_steal_t p);
+/* Fire-and-forget one-shot in the SFX pool. Returns a handle, or -1.
+ * `prio` 0..255: higher survives stealing longer. */
+int  mc_sfx_play(mc_synth* s, int ch, int program, int note, int vel, int prio);
+void mc_sfx_stop(mc_synth* s, int handle);
+int  mc_sfx_active(const mc_synth* s);
+
+/* ------------------------------------------------------------ sequencers
+ * Two sources, one renderer. Neither allocates a per-song event table.
+ *   FILE  : parse straight out of a blob (cart ROM, mmap, embedded array).
+ *           Per-track cursors + incremental tempo, O(tracks) state.
+ *   STREAM: events arrive as wire frames from another MCU.
+ */
+typedef struct mc_seq mc_seq;
+
+mc_seq* mc_seq_open_file(const void* smf, size_t bytes, int sampleRate);
+mc_seq* mc_seq_open_stream(int sampleRate, int ppqn);
+void    mc_seq_free(mc_seq* q);
+
+/* Push a chunk: `ev` is count * (dt:u8 ms, status, a, b). Returns MC_OK,
+ * -1 if the ring is full (apply backpressure), MC_ERR_ARG on bad input. */
+int  mc_seq_push(mc_seq* q, const uint8_t* ev, int count, uint16_t dur_ms);
+/* Push one wire frame: A5 | type | len:u16 | payload | crc8. */
+int  mc_seq_push_frame(mc_seq* q, const uint8_t* frame, size_t bytes);
+int  mc_seq_pending(const mc_seq* q);            /* ms of events queued   */
+void mc_seq_flush(mc_seq* q);                    /* drop queue, resync    */
+/* Renders from the sequencer, applying events at sample-accurate offsets. */
+void mc_seq_render(mc_synth* s, mc_seq* q, int16_t* out, int frames, int* done);
+uint32_t mc_seq_position(const mc_seq* q);
+
 #endif
 
 #define MC_MAX_CHANNELS 16
-#define MC_MAX_VOICES   32   /* hard ceiling at build time */
+#define MC_MAX_VOICES 64   /* hard ceiling at build time */
 
 /* ------------------------------------------------------------------ errors */
 enum {
@@ -68,7 +115,17 @@ void mc_control_change(mc_synth* s, int ch, int cc, int value);
 void mc_pitch_bend(mc_synth* s, int ch, int value);   /* -8192..+8191 */
 void mc_channel_pressure(mc_synth* s, int ch, int value);
 void mc_all_notes_off(mc_synth* s, int hard);
-void mc_set_master_gain(mc_synth* s, int gain_q8);    /* 0..256, 256 = 1.0 */
+void mc_set_master_gain(mc_synth* s, int gain_q8);
+
+/* Derive band-limited copies of every stored wavetable into `buf`, so high notes
+ * do not alias. Fills as many levels as fit and returns the number derived; 0
+ * leaves the engine working exactly as before. Budget about 512 bytes per level
+ * per table (101 tables x 3 levels = ~150 KB). Put it in PSRAM. */
+int mc_build_mips(mc_synth* s, void* buf, size_t bytes);
+/* Which channel is percussion; -1 disables drums entirely. Channel 10 is the
+ * default, but a program change received on it switches that channel to
+ * melodic (game rips rely on this). */
+void mc_set_drum_channel(mc_synth* s, int ch);    /* 0..256, 256 = 1.0 */
 
 /* ----------------------------------------------------------------- render
  * Writes `frames` interleaved stereo int16. Always fills the whole buffer.
@@ -110,5 +167,91 @@ const char* mc_last_error(const mc_synth* s);
 
 #ifdef __cplusplus
 }
+
+/* ------------------------------------------------- voice pools / one-shots
+ * Split the voice array so sound effects can never steal a music note and
+ * music can never steal an effect. Both pools are carved from maxVoices.
+ * Pools are optional: until mc_set_voice_pools() is called there is one pool.
+ */
+typedef enum {
+  MC_STEAL_OLDEST = 0,   /* default: first-in wins the axe   */
+  MC_STEAL_QUIETEST,     /* quietest voice is reused         */
+  MC_STEAL_LOWPRI        /* lowest prio, then oldest         */
+} mc_steal_t;
+
+int  mc_set_voice_pools(mc_synth* s, int musicVoices, int sfxVoices);
+void mc_set_steal_policy(mc_synth* s, mc_steal_t p);
+/* Fire-and-forget one-shot in the SFX pool. Returns a handle, or -1.
+ * `prio` 0..255: higher survives stealing longer. */
+int  mc_sfx_play(mc_synth* s, int ch, int program, int note, int vel, int prio);
+void mc_sfx_stop(mc_synth* s, int handle);
+int  mc_sfx_active(const mc_synth* s);
+
+/* ------------------------------------------------------------ sequencers
+ * Two sources, one renderer. Neither allocates a per-song event table.
+ *   FILE  : parse straight out of a blob (cart ROM, mmap, embedded array).
+ *           Per-track cursors + incremental tempo, O(tracks) state.
+ *   STREAM: events arrive as wire frames from another MCU.
+ */
+typedef struct mc_seq mc_seq;
+
+mc_seq* mc_seq_open_file(const void* smf, size_t bytes, int sampleRate);
+mc_seq* mc_seq_open_stream(int sampleRate, int ppqn);
+void    mc_seq_free(mc_seq* q);
+
+/* Push a chunk: `ev` is count * (dt:u8 ms, status, a, b). Returns MC_OK,
+ * -1 if the ring is full (apply backpressure), MC_ERR_ARG on bad input. */
+int  mc_seq_push(mc_seq* q, const uint8_t* ev, int count, uint16_t dur_ms);
+/* Push one wire frame: A5 | type | len:u16 | payload | crc8. */
+int  mc_seq_push_frame(mc_seq* q, const uint8_t* frame, size_t bytes);
+int  mc_seq_pending(const mc_seq* q);            /* ms of events queued   */
+void mc_seq_flush(mc_seq* q);                    /* drop queue, resync    */
+/* Renders from the sequencer, applying events at sample-accurate offsets. */
+void mc_seq_render(mc_synth* s, mc_seq* q, int16_t* out, int frames, int* done);
+uint32_t mc_seq_position(const mc_seq* q);
+
 #endif
+
+/* ------------------------------------------------- voice pools / one-shots
+ * Split the voice array so sound effects can never steal a music note and
+ * music can never steal an effect. Both pools are carved from maxVoices.
+ * Pools are optional: until mc_set_voice_pools() is called there is one pool.
+ */
+typedef enum {
+  MC_STEAL_OLDEST = 0,   /* default: first-in wins the axe   */
+  MC_STEAL_QUIETEST,     /* quietest voice is reused         */
+  MC_STEAL_LOWPRI        /* lowest prio, then oldest         */
+} mc_steal_t;
+
+int  mc_set_voice_pools(mc_synth* s, int musicVoices, int sfxVoices);
+void mc_set_steal_policy(mc_synth* s, mc_steal_t p);
+/* Fire-and-forget one-shot in the SFX pool. Returns a handle, or -1.
+ * `prio` 0..255: higher survives stealing longer. */
+int  mc_sfx_play(mc_synth* s, int ch, int program, int note, int vel, int prio);
+void mc_sfx_stop(mc_synth* s, int handle);
+int  mc_sfx_active(const mc_synth* s);
+
+/* ------------------------------------------------------------ sequencers
+ * Two sources, one renderer. Neither allocates a per-song event table.
+ *   FILE  : parse straight out of a blob (cart ROM, mmap, embedded array).
+ *           Per-track cursors + incremental tempo, O(tracks) state.
+ *   STREAM: events arrive as wire frames from another MCU.
+ */
+typedef struct mc_seq mc_seq;
+
+mc_seq* mc_seq_open_file(const void* smf, size_t bytes, int sampleRate);
+mc_seq* mc_seq_open_stream(int sampleRate, int ppqn);
+void    mc_seq_free(mc_seq* q);
+
+/* Push a chunk: `ev` is count * (dt:u8 ms, status, a, b). Returns MC_OK,
+ * -1 if the ring is full (apply backpressure), MC_ERR_ARG on bad input. */
+int  mc_seq_push(mc_seq* q, const uint8_t* ev, int count, uint16_t dur_ms);
+/* Push one wire frame: A5 | type | len:u16 | payload | crc8. */
+int  mc_seq_push_frame(mc_seq* q, const uint8_t* frame, size_t bytes);
+int  mc_seq_pending(const mc_seq* q);            /* ms of events queued   */
+void mc_seq_flush(mc_seq* q);                    /* drop queue, resync    */
+/* Renders from the sequencer, applying events at sample-accurate offsets. */
+void mc_seq_render(mc_synth* s, mc_seq* q, int16_t* out, int frames, int* done);
+uint32_t mc_seq_position(const mc_seq* q);
+
 #endif /* MIDICORE_H */

@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 midicore contributors
+ */
+/*
  * mc_bank.h -- the SYN2 instrument bank format.
  *
  * A bank is a flat, little-endian blob that can be memory-mapped straight from

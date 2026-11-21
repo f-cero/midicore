@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 midicore contributors
 #!/usr/bin/env python3
 """
 sf2_to_bank.py -- translate SoundFont 2 samples into SYN2 operator programs.
@@ -463,56 +465,48 @@ def analyse_drum(sf, pcm, p, add_table):
 
 # ---------------------------------------------------------------- emit bank
 def pack_patch(opcount, tbl, modidx, out, att, dec, sus, rel, algo,
-               level=100, gain=104, pan=0, veldepth=64, keytrack=24,
+               level=100, gain=104, pan=0, veldepth=96, keytrack=24,
                lfo_mode=0, lfo_rate=64, lfo_delay=0, lfo_vib=0, lfo_trem=0,
                filt=0, filtres=0, filtcut=127, envamt=0, keytrk=0,
                tbl2=0, mul2=2, det2=0):
-    b = bytearray(MC_PATCH_BYTES)
-    b[0] = max(1, min(4, opcount))
-    b[1] = algo & 3
-    b[2] = 0
-    b[3] = 0
-    b[4] = veldepth & 127
-    b[5] = keytrack & 127
-    b[6] = filt & 3
-    b[7] = filtres & 127
-    b[8] = filtcut & 127
-    b[9] = envamt & 127
-    b[10] = keytrk & 127
-    b[11] = lfo_mode & 3
-    b[12] = lfo_rate & 127
-    b[13] = lfo_delay & 255
-    b[13] = lfo_vib & 127
-    b[14] = lfo_trem & 127
-    b[15] = gain & 127
-    b[16] = pan & 0xFF
-    b[17] = 0      # pitchEnvAmt
-    b[18] = 0      # pitchEnvRate
-    b[19] = 0      # pad0
-    b[20:24] = b'\0\0\0\0'
-    # op0 = carrier
-    b[24] = tbl & 0xFF
-    b[25] = 1
-    b[26] = level & 127
-    b[27] = keytrack & 127
-    b[28] = 0
-    b[29] = att & 127
-    b[30] = dec & 127
-    b[31] = sus & 127
-    b[32] = rel & 127
-    b[33] = min(127, out) & 127
-    # op1 = modulator
-    b[34] = tbl2 & 0xFF
-    b[35] = mul2 & 0xFF
-    b[36] = modidx & 127
-    b[37] = 0
-    b[38] = det2 & 0xFF
-    b[39] = att & 127
-    b[40] = min(127, dec + 18) & 127
-    b[41] = 0
-    b[42] = rel & 127
-    b[43] = 0
-    return bytes(b)
+    """Pack one 64-byte patch. Field order mirrors mc_patch in mc_bank.h exactly;
+    any mismatch here silently corrupts every field after the first slip, so the
+    layout is expressed once as a struct format instead of byte indices."""
+    # 20 bytes of patch fields, then 4 reserved, then 4 x 10-byte operators
+    hdr = struct.pack('<16BbbBBxxxx',
+        max(1, min(4, opcount)) & 0xFF,   # 0  opCount
+        algo & 3,                          # 1  algorithm
+        0,                                 # 2  flags
+        veldepth & 127,                    # 3  velDepth
+        keytrack & 127,                    # 4  keyTrack
+        filt & 3,                          # 5  filterMode
+        filtres & 127,                     # 6  filterRes
+        filtcut & 127,                     # 7  filterCut
+        envamt & 127,                      # 8  filterEnvAmt
+        keytrk & 127,                      # 9  filterKeyTrk
+        lfo_mode & 3,                      # 10 lfoMode
+        lfo_rate & 127,                    # 11 lfoRate
+        lfo_delay & 255,                   # 12 lfoDelay
+        lfo_vib & 127,                     # 13 lfoVib
+        lfo_trem & 127,                    # 14 lfoTrem
+        gain & 127,                        # 15 gain
+        pan,                               # 16 pan
+        0,                                 # 17 pitchEnvAmt
+        0,                                 # 18 pitchEnvRate
+        0)                                 # 19 pad0
+
+    def op(table, mul, lvl, att_, dec_, sus_, rel_, out_, det=0, ks=24):
+        return struct.pack('<BBBBbBBBBB',
+            table & 0xFF, mul & 0xFF, lvl & 127, ks & 127,
+            det, att_ & 127, dec_ & 127, sus_ & 127, rel_ & 127, out_ & 127)
+
+    ops = op(tbl, 1, level, att, dec, sus, rel, out)
+    ops += op(tbl2, mul2, modidx, att, min(127, dec + 18), 0, rel, 0, det2)
+    ops += op(0, 1, 0, att, dec, 0, rel, 0)
+    ops += op(0, 1, 0, att, dec, 0, rel, 0)
+    b = hdr + ops
+    assert len(b) == MC_PATCH_BYTES, f"patch is {len(b)} bytes, expected {MC_PATCH_BYTES}"
+    return b
 
 def write_bank(path, tables, patches):
     tbl_bytes = b''.join(np.asarray(t, dtype='<i2').tobytes() for t in tables)
